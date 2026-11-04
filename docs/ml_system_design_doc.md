@@ -25,7 +25,7 @@
    - [1.4. Предпосылки решения](#14-предпосылки-решения)
 2. [Методология](#2-методология)
    - [2.1. Постановка задачи](#21-постановка-задачи)
-   - [2.2. Тектовое описание архитектуры решения](#22-тектовое-описание-архитектуры-решения)
+   - [2.2. Архитектура решения](#22-архитектура-решения-блок-схема--описание)
    - [2.3. Этапы решения задачи](#23-этапы-решения-задачи)
 3. [Подготовка пилота](#3-подготовка-пилота)
 4. [Внедрение](#4-внедрение)
@@ -217,11 +217,110 @@ Latency: на RTX 5070 Qwen2.5-7B Q4 выдаёт ~75–90 tok/s; prefill 2k т�
 
 Если локальные модели покажут недостаточное качество — fallback на gpt-4o-mini, claude haiku 5.5 (требуют LLM-API, платно, см. расчёт стоимости в разделе 2.3 этап 3). Стек boosting-модели (CatBoost / LightGBM / XGBoost) также фиксируется на этапе EDA; предпочтение отдаётся CatBoost благодаря встроенной поддержке категориальных признаков (тикер, сектор) — для 30 тикеров рекомендуется target encoding / leave-one-out вместо one-hot, чтобы избежать проклятия размерности.
 
-### 2.2. Тектовое описание архитектуры решения
+### 2.2. Архитектура решения
 
-Ниже представлено текстовое описание архитектуры решения AInvestor — поток данных от источников до пользовательского API-ответа. Архитектура явно разделяет ветку бейзлайна и ветку MVP (двухблочная архитектура boosting + LLM-агент с последующим комбинатором).
+Ниже представлена блок-схема решения AInvestor в формате Mermaid (рендерится в GitHub/VS Code/Obsidian/Notion) и её текстовое описание. Архитектура явно разделяет:
+- **поток обучения** boosting-модели (еженедельный cron → train → артефакт в MinIO),
+- **поток инференса** с двумя ветками: **baseline** (только boosting на OHLCV-фичах) и **MVP** (двухблочная архитектура boosting + LLM-агент с последующим комбинатором).
 
-**Ключевые блоки решения и связи между ними:**
+Это разделение позволяет одновременно оценивать обе модели на одних и тех же тестовых данных и количественно измерять добавленную ценность LLM-коррекции.
+
+```mermaid
+flowchart TD
+    %% ─── Источники данных ───
+    subgraph SRC["1. Источники данных"]
+        direction LR
+        MOEX["MOEX ISS API<br/>OHLCV + фундаменталы"]
+        YF["yfinance / Alpha Vantage<br/>fallback-цены"]
+        NEWS["NewsAPI + RSS<br/>РБК, Интерфакс,<br/>Коммерсантъ, ТАСС"]
+        EDISC["e-disclosure.ru<br/>HTML-парсинг"]
+        FH["Finnhub / Polygon<br/>англ. новости"]
+    end
+
+    %% ─── ETL ───
+    ETL["2. ETL-пайплайн (Python + cron)<br/>Парсинг → Дедупликация → Нормализация<br/>→ Embeddings (bge-m3 локально)"]
+
+    %% ─── DWH ───
+    subgraph DWH["3. DWH"]
+        direction LR
+        MINIO[("MinIO (canonical)<br/>Parquet: OHLCV, news<br/>embeddings, sentiment,<br/>model artifacts")]
+        PG[("PostgreSQL<br/>metadata: подписки,<br/>прогнозы, news_metadata")]
+        REDIS[("Redis<br/>кэш прогнозов<br/>+ очередь Celery")]
+    end
+
+    %% ─── Feature engineering ───
+    FE["4. Feature engineering<br/>лаги OHLCV (t-1..t-20),<br/>RSI/MACD/BB/ATR/OBV,<br/>news embeddings (mean pool 7d),<br/>sentiment, макро-фичи"]
+
+    %% ─── Обучение boosting (отдельный поток) ───
+    subgraph TRAIN["5. Обучение boosting (еженедельный cron)"]
+        direction TB
+        CRON["Cron: воскресенье 02:00 MSK"]
+        TRAINDATA["Train data<br/>2023-01..2025-03 (~27 мес)<br/>rolling-window CV, 3 фолда"]
+        BOOST_TRAIN["CatBoost / LightGBM / XGBoost<br/>reg: return_pct(t+h)<br/>clf: dir(t+h) up/down/flat<br/>target encoding для категориальных"]
+        ARTIFACT["Model artifact .cbm → MinIO<br/>версия snapshot_YYYYMMDD"]
+        CRON --> TRAINDATA --> BOOST_TRAIN --> ARTIFACT
+    end
+
+    %% ─── Инференс ───
+    subgraph INFER["6. Инференс"]
+        direction TB
+        BOOST_INF["Boosting inference<br/>• Baseline: только OHLCV-фичи<br/>• MVP блок 1: + news embeddings + sentiment"]
+        LLM["MVP блок 2: LLM-агент<br/>Qwen2.5-7B Q4 (локально, vLLM/Ollama)<br/>или fallback GPT-4o-mini / Claude Haiku 5.5<br/>вход: тикер + baseline_прогноз + 5-10 новостей<br/>выход: delta_pct, confidence, reasoning"]
+        COMBINE["Комбинатор прогноза<br/>F = boost × (1 + delta_pct/100)<br/>delta_pct ∈ [-10, +10]<br/>при confidence ≤ 0.3 → low-confidence"]
+        BOOST_INF --> LLM
+        BOOST_INF --> COMBINE
+        LLM --> COMBINE
+    end
+
+    %% ─── API слой ───
+    subgraph API["7. API слой"]
+        direction TB
+        FASTAPI["FastAPI (localhost:8000)<br/>/predict /subscribe<br/>/portfolio /health<br/>auth: статический токен в .env"]
+        SCHED["Scheduler (Celery beat)<br/>SHORT: cron 15–60 мин<br/>(MVP-инференс только при новых новостях,<br/>иначе только baseline-пересчёт)<br/>LONG: по запросу"]
+        FASTAPI --> SCHED
+    end
+
+    %% ─── Пользователь ───
+    USER(["Автор (single-user)<br/>watchlist до 30 тикеров MOEX<br/>режимы short/long"])
+
+    %% ─── Связи основных потоков ───
+    SRC --> ETL
+    ETL --> MINIO
+    ETL --> PG
+    MINIO --> FE
+    PG --> FE
+    FE --> BOOST_INF
+    FE --> TRAINDATA
+    ARTIFACT --> BOOST_INF
+    COMBINE --> FASTAPI
+    SCHED --> BOOST_INF
+    USER -->|запрос /predict| FASTAPI
+    FASTAPI -->|прогноз + Δ + новости| USER
+    REDIS -. кэш прогнозов (TTL 30 мин) .-> FASTAPI
+
+    %% ─── Стили ───
+    classDef dataSrc fill:#162235,stroke:#37DCF2,stroke-width:2px,color:#FFFFFF
+    classDef dwh fill:#1A1A1A,stroke:#C9A84C,stroke-width:2px,color:#FFFFFF
+    classDef train fill:#0C1F1A,stroke:#3DDBB5,stroke-width:2px,color:#FFFFFF
+    classDef infer fill:#1A2330,stroke:#D4875A,stroke-width:2px,color:#FFFFFF
+    classDef api fill:#F5F2E8,stroke:#C9A84C,stroke-width:2px,color:#1A1A1A
+    classDef user fill:#C9A84C,stroke:#1A1A1A,stroke-width:2px,color:#1A1A1A
+
+    class MOEX,YF,NEWS,EDISC,FH dataSrc
+    class MINIO,PG,REDIS dwh
+    class CRON,TRAINDATA,BOOST_TRAIN,ARTIFACT train
+    class BOOST_INF,LLM,COMBINE infer
+    class FASTAPI,SCHED api
+    class USER user
+```
+
+**Пояснения к потокам на схеме:**
+
+- **Поток обучения** (блок 5, выделен зелёным): cron-еженедельно запускает обучение boosting на train-данных (окно 27 месяцев), модель-артефакт сохраняется в MinIO с версией `snapshot_YYYYMMDD`. Этот поток独立 от инференса и работает офлайн.
+- **Поток инференса** (блок 6, выделен оранжевым): на каждый запрос (short-tick или long-запрос) boosting inference берёт свежие фичи + последний артефакт модели из MinIO и выдаёт baseline-прогноз. В MVP дополнительно вызывается LLM-агент с baseline-прогнозом и новостным контекстом → возвращает `delta_pct` → комбинатор считает финальный `F = boost × (1 + delta_pct/100)`.
+- **Baseline vs MVP**: блок-схема явно показывает, что baseline использует только верхнюю ветку (Boosting inference → напрямую в API), а MVP добавляет нижнюю ветку (LLM-агент → Комбинатор). Это позволяет на одних и тех же тестовых данных сравнивать обе модели.
+
+**Ключевые блоки решения и связи между ними (текстовое описание):**
 
 - **Источники данных.** Используется пять категорий источников: MOEX ISS API для официальных OHLCV-данных и фундаменталов по тикерам MOEX; yfinance / Alpha Vantage для fallback-цен (yfinance — неофициальный доступ к Yahoo, без SLA, регулярные поломки/throttling — качество частичное); NewsAPI + RSS-фиды для новостного контента из русскоязычных источников (РБК, Интерфакс, Коммерсантъ, ТАСС; e-disclosure.ru — веб-портал корпоративных раскрытий, требует HTML-парсинга); Finnhub / Polygon для англоязычного новостного потока и insider trades (Finnhub free tier — non-commercial only). SEC EDGAR исключён в итерации 1 (после делистинга ADR российских эмитентов актуальных 10-K/10-Q по топ-30 MOEX нет).
 - **ETL-пайплайн.** Реализован на Python, оркестрируется через cron на итерации 1 (Airflow заложен как технический долг для итерации 2). ETL выполняет парсинг API/RSS, дедупликацию статей по URL+timestamp, нормализацию текста (lowercase, удаление HTML, токенизация), и сохранение в DWH. Для новостей дополнительно вычисляются embeddings (`bge-m3` локально или `text-embedding-3-small` через OpenAI).
@@ -291,7 +390,7 @@ Latency: на RTX 5070 Qwen2.5-7B Q4 выдаёт ~75–90 tok/s; prefill 2k т�
   Для каждого горизонта `h ∈ {1, 2, 3, 5}` — отдельный датасет с целевой переменной `close(t+h)`. Rolling-window cross-validation с шагом 1 месяц, 3 фолда.
 - **Горизонт, гранулярность, частота пересчёта.** Горизонт `h ∈ {1, 2, 3, 5}` торговых дней, гранулярность daily, частота пересчёта — еженедельный ретрейн по cron.
 - **Целевая переменная.** Регрессия: `return_pct(t+h) = (close(t+h) - close(t)) / close(t) × 100`. Классификация: `dir(t+h) = up if return_pct > 0.5%, down if < -0.5%, flat if |return_pct| ≤ 0.5%`. **Важно про DA**: при пороге flat 0.5% и дневной волатильности MOEX доля flat-дней ~40–50%, что завышает DA на 3 классах. Поэтому основная метрика DA считается на up/down (без flat) — то есть из выборки исключаются дни с flat-фактом и flat-прогнозом. Дополнительно считается DA_3class (на всех 3 классах) как secondary метрика.
-- **Метрики качества (Бейзлайн).** RMSE/MAE на `return_pct` — для контроля абсолютной ошибки; Directional Accuracy (доля верно предсказанных up/down/flat) — целевая метрика ≥ 55%; Hit Rate top-5 — для long-only стратегии по top-5 тикеров с максимальным expected return ≥ 60%. Целевые значения обоснованы бизнес-целью: при DA=50% (random) стратегия не имеет добавленной ценности; при DA≥55% — превышает комиссию MOEX и потенциально прибыльна.
+- **Метрики качества (Бейзлайн).** RMSE/MAE на `return_pct` — для контроля абсолютной ошибки; **Directional Accuracy** (доля верно предсказанных up/down, без flat — см. ниже) — фиксируется по результатам обучения как **baseline-уровень для сравнения MVP**, без жёсткого порога сверху (чем выше baseline DA, тем лучше — но MVP должен его превзойти минимум на 3 п.п., см. раздел 3.2); **Hit Rate top-5** — для long-only стратегии по top-5 тикеров с максимальным expected return. Контекст: при DA=50% (random) стратегия не имеет добавленной ценности; типичный DA_baseline для daily-прогноза MOEX на OHLCV-фичах ожидается в диапазоне 50–55% по результатам EDA. Конкретные целевые пороги для **MVP** (DA_MVP ≥ 55%, ΔDA ≥ 3 п.п.) зафиксированы в разделе 3.2 — это Single Source of Truth для порогов успеха.
 - **Результат этапа.** Обученная модель boosting для каждого горизонта `h ∈ {1, 2, 3, 5}`; артефакты в MinIO; отчёт с метриками на walk-forward CV; feature importance top-20.
 - **Риски.** Распределение `return_pct` имеет тяжёлые хвосты (влияние санкционных новостей 2022–2026); митигация — robust loss (Huber loss в LightGBM) и winsorization целевой на ±20%.
 
@@ -347,7 +446,7 @@ Latency: на RTX 5070 Qwen2.5-7B Q4 выдаёт ~75–90 tok/s; prefill 2k т�
 
 Пилот считается успешным при одновременном выполнении следующих формализованных метрик:
 
-- **Directional Accuracy (MVP) ≥ 55%** на тестовом окне данных, при этом `DA(baseline) ≤ 52%; ΔDA ≥ 3 п.п.`
+- **Directional Accuracy (MVP) ≥ 55%** на тестовом окне данных, при этом **`ΔDA = DA_MVP − DA_baseline ≥ 3 п.п.`** (улучшение относительно baseline, статистически значимое по paired bootstrap, `p < 0.05`). Качество самого baseline **не ограничивается сверху** — чем выше baseline DA, тем выше должна быть и MVP для достижения ΔDA ≥ 3 п.п.; если baseline окажется высоким (например, DA_baseline = 60%), то MVP потребуется DA ≥ 63%. Это сознательное решение: фиксируем только требования к качеству MVP и улучшению относительно baseline, не ограничивая сам baseline (предыдущая формулировка «DA(baseline) ≤ 52%» создавала ложное противоречие с разделом 2.3, где для baseline порог не фиксируется).
 - **Sharpe ratio long-only стратегии (MVP) ≥ 0.8** на тестовом окне, при том что `Sharpe(baseline) ≥ 0.5`. Порог 0.8 соответствует условной годовой доходности ~15% при волатильности ~20%.
 - **Hit Rate top-5 ≥ 60%** по top-5 тикеров с максимальным expected return каждый день, доля фактически выросших на горизонте `h=5`.
 - **Improvement vs Baseline** — хотя бы одна из метрик (DA, Sharpe, Hit Rate) MVP статистически значимо (`p < 0.05`) превосходит бейзлайн на walk-forward кросс-валидации.
