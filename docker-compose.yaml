@@ -1,0 +1,27 @@
+services:
+  AInvestor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+
+    image: ainvestor:latest
+    container_name: AInvestor
+
+    network_mode: host
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Moscow
+      - UV_CACHE_DIR=/home/project/.cache/uv
+
+    volumes:
+      - ./app:/srv/project/app
+      - ainvestor_uv_cache:/home/project/.cache/uv
+
+volumes:
+  ainvestor_uv_cache:
