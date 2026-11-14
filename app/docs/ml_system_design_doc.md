@@ -340,65 +340,291 @@ flowchart TD
 
 #### Этап 1 — Подготовка данных
 
-На этом этапе собирается и нормализуется исторический датасет за период 2023-01-01..2025-09-30. Период выбран как компромисс между достаточностью для обучения и консистентностью новостного фона, однако при EDA возможна коррекция дат.
+> **Опорный EDA**: Выполнен разведочный анализ данных по 15 тикерам MOEX (топ по ликвидности IMOEX) за период 2023-01-03..2025-11-13 (~746 торговых дней). Полный отчёт — `../reports/eda/EDA_report.md`; визуализации — `../reports`; скрипты — `../eda`, `../eda`; агрегаты — `../data`. Выводы EDA напрямую формируют риски и метрики ниже.
+
+##### 1.1. Описание данных и сущностей
+
+**Состав данных** — 5 категорий сущностей, используемых в системе (детализация по таблице 1 в конце раздела):
+
+| Сущность | Источник | Гранулярность | Объём за период EDA | Качество |
+|---|---|---|---|---|
+| OHLCV daily (price) | MOEX ISS API, board TQBR | 1 строка/тикер/торговый день | 15 тикеров × ~731 день = 10 582 строки; после dropna по close = 10 240 строк | полное, без дублей, но без price-adjustment. |
+| Фундаменталы (P/E, P/B, EPS, выручка, чистая прибыль, див. доходность) | MOEX ISS + Alpha Vantage | Квартальная (4 отчёта/год/эмитент) | ~15 тикеров × ~12 кварталов = ~180 наблюдений; после forward-fill на daily-уровень ~10 240 строк × 6 показателей | проверяется на этапе 1.5.|
+| Новостной контент (заголовок, текст, дата, тикер) | NewsAPI + RSS (РБК/Интерфакс/Коммерсантъ/ТАСС) + e-disclosure.ru (HTML-парсинг) + Finnhub/Polygon | ~3–20 статей/тикер/день | оценочно ~50 000–150 000 статей за 33 мес | дубликаты, нерелевантность, задержки.|
+| Sentiment (LLM-computed) | Локальная Qwen2.5-7B на этапе 2 | 1 строка/статья | ~50 000–150 000 строк | вычисляется на этапе 2.|
+| Макро (ключевая ставка ЦБ РФ, USD/RUB, Brent) | CBR API + MOEX | Daily | ~750 строк × 3 показателя | Ок.|
+
+**Формат хранения**: Parquet в MinIO (canonical store), разбивка по сущностям (`ohlcv_daily.parquet`, `news_daily.parquet`, `fundamentals_quarterly.parquet`, `macro_daily.parquet`). Метаданные без embeddings дублируются в PostgreSQL для быстрых lookup-запросов API. Версионирование — через `snapshot_YYYYMMDD` в MinIO.
+
+##### 1.2. Выявленные проблемы с объёмом, качеством и разметкой (риски из EDA)
+
+В результате EDA (`../reports/eda/EDA_report.md`) выявлены 7 категорий проблем:
+
+1. **Корпоративные действия не корректируются MOEX ISS** — детектировано 3 события (см. `../data/processed/corporate_actions.csv`):
+   - **GMKN 2024-04-08**: -99% за день (split 100:1, цена упала с ~15 296 ₽ до 153 ₽).
+   - **PLZL 2025-03-27**: -90% за день (split 10:1, цена упала с ~18 676 ₽ до 1 868 ₽).
+   - **VTBR 2024-07-15**: +466 200% (консолидация 1000:1 + переходный период с NaN-строками 2024-07-09..12).
+     MOEX ISS отдаёт raw historical prices без adjustment (в отличие от yfinance, который отдаёт adjusted). **Решение ETL**: шаг `adjust_corporate_actions` — для каждого тикера детектировать места с |pct_change| > 50% между соседними торговыми днями, после чего forward-adjust все цены (open/high/low/close) до события на `ratio = close_after / close_before`. Реализовано в `../eda/02_eda_analysis.py` секция 3; на adjusted данных annualized volatility вернулась к реалистичным 30.7% (было 14401% из-за fake-returns на интерполяции).
+
+2. **YDEX — укороченная история**: только 348 строк с 2024-07-08 (после редомициляции Yandex NV → YDEX). До июля 2024 ценовой истории по Yandex на MOEX нет. **Решение**: либо исключить YDEX из watchlist на первых итерациях, либо обучать только на данных с 2024-07 (16 мес — минимально достаточно для boosting-бейзлайна, но не для лагов 20+).
+
+3. **Высокая cross-ticker корреляция** (средняя 0.538, медиана 0.545; максимум SBER↔YDEX = 0.795; минимум MTSS↔PLZL = 0.273) — типично для MOEX, где ~40% оборота — Сбер + Газпром + нефтегаз. Это **ограничивает ценность purely price-based фичей**: boosting без фундаменталов/новостей вырождается в market-index predictor. **Решение**: обязательное включение фундаментальных фичей (P/E, див. доходность) и новостного сигнала (LLM-агент) — это структурная мотивация двухблочной архитектуры MVP.
+
+4. **Тяжёлые хвосты распределения доходностей**: эксцесс 6.45 (vs. 0 у нормального), skew 0.26, min -22.1%, max +14.0%, std 1.93%/день. **Решение**: Huber loss в LightGBM/CatBoost (а не MSE) + winsorization целевой на ±3σ (~±6%); clip lagged features на ±10%.
+
+5. **Class imbalance** в целевой переменной `dir_1d`: up 34.5% / flat 29.7% / down 35.8% — down-класс слегка преобладает на горизонте 2023-2025 (бычий рынок MOEX, но с двумя коррекциями). **Решение**: stratified walk-forward CV; class weights в CatBoost через `class_weights=[1.0, 1.04]` для компенсации.
+
+6. **Доли flat-дней варьируют 21–39%** по тикерам (YDEX 21%, SBER 39%) — подтверждает решение диздока: основная метрика DA считается на up/down (без flat), DA_3class — secondary. Порог flat ±0.5% отсекает лишь ~30% дней; остальные 70% размечены как up/down.
+
+7. **NaN-строки в переходные дни корпоративных действий**: 23 строки (4 у VTBR 2024-07-09..12, 3 у PLZL, 4 у GMKN, 12 у YDEX в первые недели) с NaN close и нулевым объёмом — дни, когда тикер номинально торгуется, но сделок нет. **Решение**: `dropna(subset=['close'])` перед расчётом returns.
+
+##### 1.3. Процесс генерации данных
+
+**Пайплайн сбора данных (ежедневный + исторический backfill)**:
+
+1. **Исторический backfill (разовый)** — реализован в `../eda/01_fetch_moex_ohlcv.py`:
+   - Запрос к `https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/TQBR/securities/<SECID>.json?from=<START>&till=<END>&start=<N>` с пагинацией по 100 строк на запрос.
+   - Throttle 0.4 с между запросами (вежливость к API MOEX — лимитов нет, но практика хорошая).
+   - Без авторизации, без API key. Сохранение в `../data` + `../data/raw/ohlcv_all.csv` (combined long).
+
+2. **Регулярный incremental update (cron, nightly 02:00 MSK)**:
+   - Для каждого тикера из `universe.yaml` — fetch только новых строк с даты последней записи в MinIO.
+   - Запись в MinIO `ohlcv_daily.parquet` (новая версия `snapshot_YYYYMMDD`).
+   - Новости собираются через NewsAPI + RSS-парсеры ежечасно в течение торговой сессии MOEX (10:00–18:45 MSK).
+
+3. **Фундаменталы (квартально, по выходу отчётности эмитента)**:
+   - MOEX ISS endpoint `securities/<SECID>/fundamentals` (quarterly).
+   - Alpha Vantage `OVERVIEW` + `INCOME_STATEMENT` — fallback.
+   - Парсинг → forward-fill на daily-уровень: один квартал покрывает ~60 торговых дней до следующего отчёта (фичи обновляются 4 раза в год, не каждый день).
+
+4. **Макро-данные (ежедневно)**:
+   - CBR API `https://www.cbr.ru/daily_json` — ключевая ставка, USD/RUB.
+   - MOEX для Brent (тикер `BZ` на CBR или `ICE.BR` на MOEX).
+
+**Регулярность**: daily OHLCV + макро, hourly news, quarterly fundamentals. Все источники публичные; в среднем latency запроса: MOEX ISS ~0.2–0.5 с, NewsAPI 1–3 с, e-disclosure.ru — высокая (HTML-парсинг + возможная капча).
+
+##### 1.4. Достаточность данных и способы расширения
+
+Текущий объём после EDA: ~10 240 строк × 15 тикеров = **достаточно для бейзлайна CatBoost** (CatBoost эффективно работает на 10k+ строк). После генерации lagged features (lags 1..20) объём вырастет до ~30 000–40 000 строк на каждый горизонт.
+
+**Если данных окажется недостаточно** — стратегии расширения (по приоритету):
+
+1. **Расширить universe**: с 15 → 30 тикеров (полный IMOEX, как и заложено в диздоке AINV-001). Это удвоит объём до ~20 000 строк и добавит секториальное разнообразие.
+2. **Удлинить период**: с 2023-01 → 2018-01 (5+ лет). Ограничение: до 2022 на MOEX существенно другая рыночная конъюнкция (допандемийная, досанкционная, без VTBR-консолидации), что добавит structural breaks. Компромисс: 2020-01..2025-11 (6 лет) — если потребуется больше данных на итерации 2.
+3. **Minute-level данные**: с daily → intraday (1-мин OHLCV через MOEX ISS с `interval=1`). Объём вырастёт в ~390 раз, но это требует другого класса моделей (LSTM/Transformer) и не в скоупе MVP.
+4. **Cross-market features**: данные по связанным рынкам (Brent, золото, USD/RUB уже включены); при расширении — индексы других EM (Bovespa, Sensex) для cross-market momentum.
+
+**Достаточно ли текущего объёма для бейзлайна CatBoost?** Да. После FE (lagged features + cross-sectional ranks) будет ~40 000 строк × 4 горизонта = ~160 000 наблюдений для ансамбля.
+
+##### 1.5. Конфиденциальная информация
+
+**В данных нет конфиденциальной информации в GDPR/legal смысле**:
+- OHLCV — публичные рыночные данные открытой биржи MOEX.
+- Фундаменталы — раскрываются эмитентами в обязательной отчётности (e-disclosure.ru, MOEX ISS).
+- Новости — публичные RSS-ленты СМИ.
+- Макро — публичные данные ЦБ РФ.
+
+**Однако есть чувствительные аспекты, требующие обработки**:
+
+| Тип | Где | Обработка |
+|---|---|---|
+| API-токен автора (статический, single-user) | `../../.env` | Не в репозитории; `../../.gitignore` исключает `.env`; доступ только через `os.getenv()`; rotation раз в N мес. |
+| API-ключи внешних сервисов (NewsAPI, Finnhub, Alpha Vantage) | `../../.env` | То же — вне репозитория; логирование маскирует значения (`***`); разные ключи для dev/prod. |
+| Watchlist автора (подписки на тикеры) | PostgreSQL, таблица `subscriptions` | Это персональные инвестиционные намерения; доступ только через API с токеном; не логируются в plaintext; backup шифруется. |
+| Прогнозы автора (история запросов `/predict`) | PostgreSQL, таблица `predictions_history` | То же; retention 90 дней, затем агрегация до daily stats. |
+
+**Обработка**: PII-полей (имя, email, контакт автора) в данных нет — single-user режим. API-токен — единственная чувствительная строка; обрабатывается через стандартные практики (`../../.env`, отсутствие в логах).
+
+##### 1.6. Необходимый результат этапа 1
+
+- `../data/raw/ohlcv_all.csv` — сырой OHLCV по 30 тикерам MOEX за 2023-01..2025-11 (~22 000 строк после расширения universe до 30).
+- `../data/processed/returns_long.parquet` — long-format с adjusted close, ret, fwd-1d/5d/20d returns (готов в EDA).
+- `../data/processed/summary_stats.csv` — сводная по тикерам (готов в EDA).
+- `../data/processed/up_down_flat.csv` — структура направлений по тикерам (готов в EDA).
+- `../data/processed/corr_returns.csv` — корреляционная матрица (готов в EDA).
+- `../data/processed/corporate_actions.csv` — список детектированных корпоративных действий с ratio adjustment (готов в EDA).
+- `news_daily.parquet` (после этапа 2 LLM-sentiment) — статьи с embeddings, sentiment, minio_path.
+- `fundamentals_quarterly.parquet` — квартальные фундаменталы.
+- Все артефакты в MinIO версионированы по `snapshot_YYYYMMDD`.
+- `../reports/eda/EDA_report.md` + 8 визуализаций в `../reports` (готов).
+
+##### 1.7. Дополнительная информация
+
+- **Торговый календарь MOEX** не совпадает с григорианскими business-days: MOEX торгует в некоторые субботы (например, 2024-04-27 перед майскими праздниками) и не торгует в российские праздники (1–8 января, 23 февраля, 8 марта, 1 и 9 мая, 12 июня, 4 ноября). ETL должен использовать **фактический торговый календарь MOEX** (доступен через ISS API `engines/stock/markets/shares/boards/TQBR/dates`), а не `pd.bdate_range`. EDA показал, что `pd.bdate_range` создаёт 4 несуществующих дат в году.
+- **Reproducibility**: версии данных фиксированы `snapshot_YYYYMMDD` в MinIO; скрипты EDA в git; seed=42 в CatBoost. Воспроизводимость бейзлайна гарантируется.
+- **Качество источников**: MOEX ISS — primary, единственный канонический источник цен по MOEX-тикерам. yfinance — fallback только при полной недоступности MOEX (SLA нестабилен). Alpha Vantage — для фундаменталов при отсутствии на MOEX.
 
 **Таблица 1. Источники данных и сущности для обучения ML-модели**
 
-| Название данных | Источник (есть в компании) | Ресурс для получения | Качество проверено                                                                                         |
-|---|---|---|------------------------------------------------------------------------------------------------------------|
-| OHLCV daily, MOEX | MOEX ISS API (iss.moex.com/iss) | DS (Python + requests) | Да                                                                                                         |
-| OHLCV daily, US/ADR | yfinance (старший fallback) | DS | Да                                                                                                         |
-| OHLCV daily, расширенный | Alpha Vantage API (free tier, 25 req/день) | DS | Частично (лимиты)                                                                                          |
-| Фундаменталы (P/E, P/B, EPS) | MOEX ISS + Alpha Vantage | DS | Да                                                                                                         |
+| Название данных | Источник | Ресурс для получения | Качество проверено |
+|---|---|---|---|
+| OHLCV daily, MOEX | MOEX ISS API (iss.moex.com/iss) | DS (Python + requests) | Да (EDA: 10 240 чистых строк) |
+| OHLCV daily, US/ADR (legacy) | yfinance (старший fallback) | DS | Частично (без SLA, throttling) |
+| OHLCV daily, расширенный | Alpha Vantage API (free tier, 25 req/день) | DS | Частично (лимиты) |
+| Фундаменталы (P/E, P/B, EPS) | MOEX ISS + Alpha Vantage | DS | Да |
 | Новости, русскоязычные | RSS РБК / Интерфакс / Коммерсантъ / ТАСС + e-disclosure.ru (веб-портал, HTML-парсинг) | DS | РБК/Интерфакс/ТАСС — Да; Коммерсантъ — частично (часть контента за деньги); e-disclosure — требует HTML-парсинга |
 | Новости, англоязычные | NewsAPI (free: dev-only, 24ч задержка, localhost-only) + Finnhub (free: 60 req/мин, non-commercial only) + Polygon | DS | NewsAPI — для MVP (при коммерциализации — Business $449/мес); Finnhub — для paper trading (non-commercial) |
-| Sentiment (pre-computed) | Finnhub sentiment API | DS | Частично                                                                                                   |
-| Sentiment (LLM-computed) | Локальная модель Qwen2.5 7B (плагин к ETL) | DS | На этапе 2                                                                                                 |
-| Макро (ключевая ставка ЦБ, USD/RUB, Brent) | CBR API + MOEX | DS | Да                                                                                                         |
-| Календарь событий MOEX | MOEX ISS (engine + board groups) | DS | Да                                                                                                         |
-
-*Таблица 1. Перечень сущностей и источников данных. Окончательный список уточняется по результатам EDA.*
-
-**Результат этапа 1**: три Parquet-датасета в MinIO (`ohlcv_daily.parquet` — OHLCV по 30 тикерам за ~33 месяца (2023-01..2025-09),
-`news_daily.parquet` — статьи с заголовком, текстом, датой, тикером, embedding, sentiment;
-`fundamentals_quarterly.parquet` — квартальные фундаменталы).
-Все Parquet-файлы версионированы по дате создания (`snapshot_YYYYMMDD`).
-
-**Возможные риски этапа 1:**
-
-- Лимиты API: Alpha Vantage free tier — 25 запросов/день, недостаточно для исторического сбора; митигация: постепенный сбор с sleep-задержками, покупка premium tier ($50/мес) при необходимости.
-- **NewsAPI free tier**: dev-only, 24-часовая задержка новостей, разрешён только localhost. Для MVP на собственном ПК допустимо; при коммерциализации продукта — обязательный upgrade на Business ($449/мес) или замена на другой источник.
-- **Finnhub free tier**: non-commercial only — для paper trading, при коммерциализации продукта нужен платный тариф (от $24/мес). Аналогично — yfinance неофициален, без SLA, регулярные поломки/throttling; использовать только как fallback после MOEX ISS.
-- **e-disclosure.ru**: нужен HTML-парсинг, возможны капча-подобные ограничения. Трудозатраты ETL выше, чем для RSS-источников.
-- Качество новостных данных: русскоязычные RSS могут содержать дубликаты и/или нерелевантные статьи. Митигация: дедупликация по `URL+title_hash`, и LLM-фильтрация релевантности на этапе feature engineering.
-- Расхождения таймстампов: MOEX ISS хранит время в MSK, RSS-фиды могут использовать UTC или не указывать зону; митигация: унификация всех timestamp в MSK на этапе ETL.
+| Sentiment (pre-computed) | Finnhub sentiment API | DS | Частично |
+| Sentiment (LLM-computed) | Локальная Qwen2.5-7B (плагин к ETL) | DS | На этапе 2 |
+| Макро (ключевая ставка ЦБ, USD/RUB, Brent) | CBR API + MOEX | DS | Да |
+| Календарь событий MOEX | MOEX ISS (engine + board groups + trading dates) | DS | Да |
 
 #### Этап 2 — Построение прогнозных моделей
 
-Этап делится на baseline (только OHLCV-фичи) и MVP (расширенное множество признаков с новостями).
-Целевая переменная для регрессии — `close(t+h)`, нормированная на `close(t)` (`return_pct = (close(t+h) / close(t) - 1) × 100`, возврат в процентах).
-Это нормирование снимает проблему абсолютного уровня цен у разных тикеров и делает модель обучаемой в едином пайплайне.
+Этап делится на baseline (только OHLCV-фичи) и MVP (расширенное множество признаков с новостями). Целевая переменная для регрессии — `return_pct(t+h) = (close(t+h) - close(t)) / close(t) × 100`, возврат в процентах. Это нормирование снимает проблему абсолютного уровня цен у разных тикеров (SBER ~300 ₽ vs LKOH ~7 000 ₽) и делает модель обучаемой в едином пайплайне.
 
-##### Описание техники — Бейзлайн
+##### 2.1. ML-метрики и функции потерь
 
-- **Формирование выборки.** **Единая таймлайн-схема (согласовано с разделами 1.1, 1.2, 3.1):**
-  - **Train**: 2023-01-01..2025-03-31 (~27 месяцев)
-  - **Validation (walk-forward)**: 2025-04-01..2025-06-30 (3 месяца)
-  - **Test**: 2025-07-01..2025-09-30 (3 месяца)
-  - **A/B-бэктест пилота (раздел 3.1)**: walk-forward за период 2024-07-01..2025-06-30 (12 месяцев) — это подмножество Train+Validation, выбранное для проверки устойчивости стратегии на более длинном окне.
-  - **Весь исторический датасет**: 2023-01-01..2025-09-30 (~33 месяца) — согласовано с этапом 1.
-  Для каждого горизонта `h ∈ {1, 2, 3, 5}` — отдельный датасет с целевой переменной `close(t+h)`. Rolling-window cross-validation с шагом 1 месяц, 3 фолда.
-- **Горизонт, гранулярность, частота пересчёта.** Горизонт `h ∈ {1, 2, 3, 5}` торговых дней, гранулярность daily, частота пересчёта — еженедельный ретрейн по cron.
-- **Целевая переменная.** Регрессия: `return_pct(t+h) = (close(t+h) - close(t)) / close(t) × 100`. Классификация: `dir(t+h) = up if return_pct > 0.5%, down if < -0.5%, flat if |return_pct| ≤ 0.5%`. **Важно про DA**: при пороге flat 0.5% и дневной волатильности MOEX доля flat-дней ~40–50%, что завышает DA на 3 классах. Поэтому основная метрика DA считается на up/down (без flat) — то есть из выборки исключаются дни с flat-фактом и flat-прогнозом. Дополнительно считается DA_3class (на всех 3 классах) как secondary метрика.
-- **Метрики качества (Бейзлайн).** RMSE/MAE на `return_pct` — для контроля абсолютной ошибки; **Directional Accuracy** (доля верно предсказанных up/down, без flat — см. ниже) — фиксируется по результатам обучения как **baseline-уровень для сравнения MVP**, без жёсткого порога сверху (чем выше baseline DA, тем лучше — но MVP должен его превзойти минимум на 3 п.п., см. раздел 3.2); **Hit Rate top-5** — для long-only стратегии по top-5 тикеров с максимальным expected return. Контекст: при DA=50% (random) стратегия не имеет добавленной ценности; типичный DA_baseline для daily-прогноза MOEX на OHLCV-фичах ожидается в диапазоне 50–55% по результатам EDA. Конкретные целевые пороги для **MVP** (DA_MVP ≥ 55%, ΔDA ≥ 3 п.п.) зафиксированы в разделе 3.2 — это Single Source of Truth для порогов успеха.
-- **Результат этапа.** Обученная модель boosting для каждого горизонта `h ∈ {1, 2, 3, 5}`; артефакты в MinIO; отчёт с метриками на walk-forward CV; feature importance top-20.
-- **Риски.** Распределение `return_pct` имеет тяжёлые хвосты (влияние санкционных новостей 2022–2026); митигация — robust loss (Huber loss в LightGBM) и winsorization целевой на ±20%.
+**Функции потерь** (обоснование выбора):
 
-##### Описание техники — MVP
+| Loss | Применение | Обоснование |
+|---|---|---|
+| **Huber loss** (LightGBM `objective='huber'`, δ=1.0; CatBoost `loss_function='Huber:delta=1.0'`) | Регрессия на `return_pct` | Робастна к выбросам — EDA показал тяжёлые хвосты (kurtosis 6.45, min -22%, max +14%); MSE inflate на эти выбросы, MAE не дифференцируема гладко. Huber = MSE около 0, MAE в хвостах — оптимальный компромисс. |
+| **Logloss** (CatBoost `loss_function='Logloss'`) | Классификация на `dir ∈ {up, down}` | Стандарт для бинарной классификации; well-calibrated вероятности нужны для комбинатора прогноза (`confidence = P(up) - P(down)`). |
+| **MultiClass** (CatBoost `loss_function='MultiClass'`) | Secondary классификация на `dir ∈ {up, flat, down}` | Только для DA_3class метрики. Primary — бинарная, чтобы избежать завышения DA через лёгкий flat-класс. |
 
-- **Расширение feature set.** К baseline-фичам добавляются: `aggregated_news_embedding` (mean pooling за 7 дней, размер 1024), `aggregated_sentiment` (взвешенное среднее по статьям, веса — по recency), `news_count_7d` (число статей за 7 дней — proxy новостной активности), `macro_features` (ключевая ставка ЦБ РФ, USD/RUB, Brent).
-- **Метрики качества (MVP).** Те же метрики, плюс ключевая бизнес-метрика — Improvement vs Baseline: `ΔDA = DA_MVP - DA_baseline ≥ 3` процентных пункта, `ΔSharpe ≥ 0.3`. Только при положительной Δ на walk-forward оправдано внедрение LLM-агента.
-- **Бизнес-проверка.** Каждую неделю должен быть мониторинг топ-10 прогнозов baseline vs MVP по выборочному тикеру, и верификация, что Δ соответствует новостному контексту (например, Δ=-5% по SBER должен сопровождаться негативной новостью о санкциях или плохой отчётности).
+**Метрики качества** (Single Source of Truth для порогов успеха — раздел 3.2):
+
+| Метрика | Что измеряет | Целевое значение |
+|---|---|---|
+| **RMSE** на `return_pct` | Абсолютную ошибку регрессии в % — контроль | ≤ 2.5% (порядок std ret = 1.93%, лучше naive zero) |
+| **MAE** на `return_pct` | Среднюю абсолютную ошибку — robust | ≤ 1.5% |
+| **Directional Accuracy (DA)** на up/down без flat | Долю верно угаданных направлений | DA_baseline: фиксируется по результатам обучения, без порога сверху (чем выше — тем лучше); DA_MVP ≥ 55% |
+| **ΔDA = DA_MVP − DA_baseline** | Улучшение от LLM-коррекции | ≥ 3 п.п. (paired bootstrap, p < 0.05) |
+| **Hit Rate top-5** | Долю случаев, когда top-5 тикеров по expected return действительно попали в top-5 по actual return | ≥ 60% |
+| **Sharpe ratio** на paper-trading стратегии | Риск-скорректированную доходность | ΔSharpe ≥ 0.3 vs baseline |
+
+**Почему именно эти метрики?** DA — основная бизнес-метрика (пользователь видит «up» или «down», не RMSE); ΔDA — ключевая бизнес-метрика ценности LLM-корректировщика (если ΔDA < 3 п.п., LLM-агент не оправдан); RMSE/MAE — для контроля качества регрессии (чтобы модель не системно ошибалась в величине движения); Sharpe — для экономической валидации в пилоте.
+
+##### 2.2. Схема ML-валидации
+
+**Walk-forward cross-validation** с учётом временной структуры данных (3 fold-а, шаг 1 мес):
+
+```
+Fold 1: Train [2023-01..2025-03]  Val [2025-04]  Test [2025-05]
+Fold 2: Train [2023-01..2025-04]  Val [2025-05]  Test [2025-06]
+Fold 3: Train [2023-01..2025-05]  Val [2025-06]  Test [2025-07]
+Final hold-out test: 2025-08..2025-11 (3 мес, out-of-sample)
+A/B-бэктест пилота: 2024-11..2025-10 (12 мес, walk-forward симуляция)
+```
+
+**Почему walk-forward, а не k-fold?**
+- Временной ряд имеет strong temporal autocorrelation и кластеризацию волатильности (EDA: kurtosis 6.45, rolling vol на 30д окне варьирует 15–60% годовых). Random k-fold перемешивает train/test, создавая data leakage через lagged features (return t-1 из train может попасть в test).
+- EDA подтвердил смену режимов волатильности: 2023 Q1 и 2025 H1 — пики. Статичная модель на одном периоде не отработает смены режимов, поэтому retrain раз в неделю (как в диздоке 4.3).
+
+**Stratification**:
+- Stratified по `ticker` (15 тикеров — YDEX minority с 348 строками) и по `dir_1d` (class imbalance 34.5/29.7/35.8%) — для balanced CV folds.
+
+**Hold-out test set**:
+- Test = 2025-08..2025-11 (3 месяца), полностью out-of-sample. На нём считается финальная DA, ΔDA, paired bootstrap.
+
+**Бизнес-валидация (A/B-бэктест за 12 месяцев)**:
+- Walk-forward бэктест за период 2024-11..2025-10: каждый торговый день t предсказывается на основе модели, обученной на данных до t. Симуляция long-only top-5 стратегии (депозит 300 000 ₽, комиссии MOEX учтены). Сравнение MVP vs baseline vs buy-and-hold MOEX. Критерий: PnL MVP > PnL baseline > PnL B&H (см. раздел 3.1).
+
+##### 2.3. Структура бейзлайна
+
+**Бейзлайн 0 — Naive (zero-skill reference)**:
+- Прогноз: `return_pct(t+h) = 0` (т.е. `close(t+h) = close(t)`).
+- DA ≈ 50% (random).
+- Цель: минимальная планка, ниже которой модель не имеет смысла.
+
+**Бейзлайн 1 — OHLCV-only CatBoost** (primary baseline):
+
+- **Предобработка** (на каждом walk-forward fold):
+  1. `dropna(subset=['close'])` — удалить переходные дни (23 строки в EDA).
+  2. `adjust_corporate_actions` — forward-adjust цен по ratio (см. Этап 1.2, реализация в `../eda/02_eda_analysis.py`).
+  3. Категориальные фичи (`ticker`, `sector`) — target encoding / leave-one-out (CatBoost нативно через `cat_features`).
+  4. Numerical features — standard scaling внутри walk-forward fold (fit на train, transform на val/test).
+  5. Winsorization целевой `return_pct` на ±3σ (~±6%).
+  6. Clip lagged features на ±10%.
+
+- **Feature set** (~25 фичей на строку):
+  - Lagged returns: `ret(t-1)`, `ret(t-2)`, `ret(t-3)`, `ret(t-5)`, `ret(t-10)`, `ret(t-20)` — 6 фичей.
+  - Технические индикаторы: RSI-14, MACD (12, 26, 9 signal), Bollinger Bands (20, 2σ: upper-lower width), ATR-14, OBV — 5 фичей.
+  - Volume features: `log(volume)`, `volume_ma_5d`, `volume_ratio_5d_20d` — 3 фичи.
+  - Volatility: `rolling_std_20d`, `rolling_std_60d`, `vol_rank_cross_sectional` — 3 фичи.
+  - Calendar: `day_of_week`, `month`, `is_month_end` — 3 фичи.
+  - Cross-sectional: `ticker_rank_by_return_1d`, `ticker_rank_by_volatility_20d` — 2 фичи.
+  - Категориальные: `ticker`, `sector` — 2 фичи.
+
+- **Модель**:
+  - `CatBoostRegressor(loss_function='Huber:delta=1.0', depth=6, learning_rate=0.05, iterations=1000, l2_leaf_reg=3.0, random_seed=42)` для `return_pct`.
+  - `CatBoostClassifier(loss_function='Logloss', depth=6, learning_rate=0.05, iterations=1000, random_seed=42)` для `dir ∈ {up, down}` (без flat).
+
+- **Процесс моделирования**:
+  1. На каждом walk-forward fold — train CatBoostRegressor и CatBoostClassifier для каждого горизонта `h ∈ {1, 2, 3, 5}`.
+  2. Сохранить артефакт `.cbm` в MinIO `models/snapshot_YYYYMMDD/baseline_h<H>.cbm`.
+  3. Логировать метрики (RMSE, MAE, DA) в `../reports`.
+  4. Feature importance top-20 через `catboost.get_feature_importance(type='ShapValues')` → `../reports`.
+  5. Weekly retrain по cron (воскресенье 02:00 MSK) — см. диздок 4.3.
+
+##### 2.4. Стратегии дальнейшего развития решения
+
+**MVP — расширение feature set** (поверх бейзлайна):
+- `aggregated_news_embedding` (mean pooling за 7 дней по 8 последним статьям, размер 1024 через bge-m3 на RTX 5070) — 1 фича × 1024 компоненты.
+- `aggregated_sentiment` (взвешенное среднее по статьям, веса — по recency: `0.9^days_ago`).
+- `news_count_7d` (число статей за 7 дней — proxy новостной активности).
+- `news_volatility_7d` (std sentiment за 7 дней — disagreement в новостях, важный сигнал).
+- `macro_features` (ключевая ставка ЦБ РФ, USD/RUB, Brent — 3 фичи).
+- LLM-корректировщик поверх boosting (Этап 3): `F = boost × (1 + Δ/100)`.
+
+**Дальнейшая оптимизация (после MVP, итерация 2+)**:
+- **Hyperopt/Optuna**: Bayesian optimization гиперпараметров CatBoost (`depth ∈ [4, 8]`, `l2_leaf_reg ∈ [1, 10]`, `bagging_temperature ∈ [0, 1]`).
+- **Stacking**: CatBoost + LightGBM + XGBoost → linear blender на validation.
+- **Time-series transformers**: TFT (Temporal Fusion Transformer) или Informer — если daily CatBoost упрётся в точность на горизонте 5+ дней.
+- **Sentiment model fine-tune**: Fine-tune bge-m3 на корпусе финансовых новостей РБК/Интерфакс для лучшего эмбеддинга (supervised contrastive на (новость, тикер, направление цены)).
+- **Online learning**: Incremental retrain CatBoost каждый день (не раз в неделю), с learning rate decay.
+- **Multi-task learning**: одна модель на все 4 горизонта (1, 2, 3, 5 дней) через multi-output head — может лучше улавливать temporal patterns.
+- **Fundamentals fine-tune**: добавление квартальных фундаменталов как «regime»-фичей (P/E rank cross-sectional, momentum выручки).
+
+##### 2.5. Анализ и интерпретация работы модели
+
+**Что ожидается от бейзлайна (по результатам EDA)**:
+- DA_baseline на up/down (без flat) ожидается **52–58%** (типичный уровень для daily MOEX price-only моделей). Это не выше, потому что:
+  - высокая cross-ticker корреляция 0.538 (модель не сможет выучить idiosyncratic alpha, всё движется синхронно с рынком);
+  - class imbalance 34.5/29.7/35.8%;
+  - limited feature set (только OHLCV-производные).
+- RMSE на `return_pct` ожидается ~2.0–2.5% (порядка std ret = 1.93%). Это означает, что модель не сильно лучше naive zero-forecast в абсолютной ошибке, но DA > 50% показывает, что она улавливает направление — а направление, а не величина, и есть бизнес-сигнал.
+
+**Интерпретация через SHAP**:
+- Ожидается, что top-5 важных фичей: `lagged_ret_1d`, `RSI_14`, `volatility_20d`, `ticker`, `day_of_week`.
+- Если `news_embedding` в MVP попадает в top-10 по SHAP — это подтверждает ценность LLM-агента.
+- Если `news_count_7d` доминирует — это proxy для volatility, а не за real news signal; нужно копать глубже (например, sentiment-weighted count).
+- Анализ `ticker`-importance: если top-3 тикера по SHAP — SBER/GAZP/LKOH (самые ликвидные), это подтверждает, что модель использует cross-sectional rank; если случайные тикеры — модель зашумлена.
+
+**Что если бейзлайн показывает DA ≤ 50%** (т.е. не лучше random)?
+- Это значит, что purely price-based signal недостаточен для MOEX daily-прогноза. В этом случае mitigation (по приоритету):
+  1. Пересмотреть горизонт (1d → 5d, больше signal/noise ratio, так как daily noise доминирует).
+  2. Усилить feature engineering (cross-sectional ranks, sector momentum, relative strength vs IMOEX).
+  3. Сократить universe (15 → 5 самых ликвидных: SBER, GAZP, LKOH, GMKN, ROSN) — меньше шума.
+  4. Подтвердить необходимость MVP-блока (LLM-агент) как структурного решения: если price-only не работает, news-signal — единственный оставшийся путь.
+
+##### 2.6. Риски этапа 2 и способы их снижения
+
+| Риск | Вероятность | Влияние | Митигация |
+|---|---|---|---|
+| Data leakage через lagged features в walk-forward CV | Средняя | Высокое (DA inflated) | Строгий walk-forward: для каждого fold train только на данных до t-N (N = max lag = 20 дней); val/test только после train. |
+| Corporate actions не обработаны → fake huge returns в train | Высокая (3 события в EDA) | Высокое | ETL-шаг `adjust_corporate_actions` обязателен (см. Этап 1.2); валидация: max(abs(ret)) < 50% после adjustment. |
+| Overfitting на walk-forward (маленький test window 3 мес) | Средняя | Среднее | 3 fold-а walk-forward + bootstrap CI для DA; если std DA по fold-ам > 5 п.п. — модель нестабильна. |
+| Concept drift (волатильность кластеризована) | Высокая | Высокое | Weekly retrain по cron (как в диздоке 4.3); мониторинг DA на скользящем окне 30 дней; alert если DA падает на 5 п.п. |
+| Class imbalance 34.5/29.7/35.8% | Средняя | Среднее | Stratified walk-forward CV; `class_weights=[1.0, 1.04]` в CatBoost; primary метрика DA на up/down (без flat). |
+| YDEX short history → bias | Средняя | Низкое (1 тикер из 15) | Исключить YDEX из обучения на ранних fold-ах; либо обучать только на данных с 2024-07. |
+| Cross-ticker корреляция 0.538 → boosting вырождается в index predictor | Высокая | Высокое | Включить фундаменталы + новости (MVP); cross-sectional rank features; обучать на residual after market-factor regression. |
+| Heavy tails (kurtosis 6.45) → MSE inflate | Высокая | Среднее | Huber loss в CatBoost + winsorization ±3σ на target; clip lagged features на ±10%. |
+
+##### 2.7. Необходимый результат этапа 2
+
+- Обученная модель boosting для каждого горизонта `h ∈ {1, 2, 3, 5}` — 4 модели (бейзлайн) + 4 модели (MVP) = 8 артефактов `.cbm` в MinIO `models/snapshot_YYYYMMDD/`.
+- Отчёт с метриками на walk-forward CV: `../reports`, `../reports`.
+- Feature importance top-20 через SHAP для каждой модели: `../reports`.
+- A/B-бэктест за 12 месяцев: `../reports` с PnL MVP vs baseline vs buy-and-hold.
+- Явный вывод go/no-go на MVP: если ΔDA < 3 п.п. — MVP-блок (LLM-агент) не оправдан, остаёмся на бейзлайне.
+
+##### 2.8. Дополнительная информация
+
+- **CatBoost vs LightGBM vs XGBoost**: выбран CatBoost как primary, потому что (1) нативная поддержка категориальных фичей (тикер, сектор) через target encoding без ручного one-hot; (2) хорошо работает на малых выборках (10k+ строк); (3) встроенная walk-forward-совместимая валидация через `eval_set`. LightGBM/XGBoost остаются как кандидаты в stacking-ансамбле (Этап 2.4).
+- **Reproducibility**: `seed=42` в CatBoost; версии данных через `snapshot_YYYYMMDD`; pinned версии библиотек в `requirements.txt` (catboost==1.2.7, pandas==2.2.3, scikit-learn==1.5.2).
+- **Compute budget**: обучение CatBoost на 40k строк × 25 фичей × 1000 iterations — ~2–5 минут на CPU (RTX 5070 не нужен для бейзлайна). MVP с news embeddings × 1024 компоненты — ~10–15 минут, тоже CPU. GPU нужен только для LLM-инференса (Этап 3) и для embeddings (bge-m3).
 
 #### Этап 3 — Разработка LLM-агента-корректировщика (только MVP)
 

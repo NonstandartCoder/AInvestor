@@ -1,0 +1,44 @@
+# Git
+.git
+.github
+.gitignore
+
+# Python virtual envs
+.venv
+venv
+env
+
+# Cache
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.ipynb_checkpoints
+
+# Data
+app/data/raw
+app/data/processed
+*.parquet
+*.csv
+*.xlsx
+
+# Build artifacts
+build
+dist
+*.egg-info
+
+# IDE
+.idea
+.vscode
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Env
+.env
+.env.*
+!.env.example
