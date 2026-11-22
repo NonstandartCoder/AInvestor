@@ -15,11 +15,12 @@ plt.rcParams["axes.unicode_minus"] = False
 
 sns.set_theme(style="whitegrid", context="talk", palette="deep")
 
-ROOT = Path("..")
+ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "data" / "raw"
 PROC = ROOT / "data" / "processed"
 FIG = ROOT / "reports" / "eda" / "figures"
 REPORT = ROOT / "reports" / "eda" / "EDA_report.md"
+FACTORS = ROOT / "data" / "reference" / "corporate_action_factors.csv"
 PROC.mkdir(parents=True, exist_ok=True)
 FIG.mkdir(parents=True, exist_ok=True)
 
@@ -67,54 +68,76 @@ summary.to_csv(PROC / "summary_stats.csv", index=False)
 # ─── 3. Returns ───────────────────────────────────────────────────────────────
 # Убираем строки, где close = NaN (дни, когда тикер номинально торгуется, но
 # сделок не было — например, переходный период консолидации VTBR 2024-07-09..12).
-# Это позволяет корректно детектировать корпоративных действи как большое процентное изменение
-# между соседними днями торгов.
+# Это позволяет корректно детектировать корпоративные действия как большое
+# процентное изменение между соседними днями торгов.
 df = df.dropna(subset=["close"]).reset_index(drop=True)
 
 # Считаем "сырой" ret для детекции corporate actions.
 df["ret_raw"] = df.groupby("ticker")["close"].pct_change(fill_method=None)
 
 # Корпоративные действия: |ret| > 50% между соседними торговыми днями — это
-# сплит или консолидация. MOEX ISS не делает коррекцию цены,
-# поэтому нужно обработать вручную: forward-adjust — умножить на все цены до события на
-# ratio = close_after / close_before, чтобы весь ценовой ряд был в после разбиения.
+# сигнал для проверки (почти наверняка сплит/консолидация), а не готовая поправка.
+# MOEX ISS не отдаёт ни adjusted-цен, ни коэффициентов корпоративных действий,
+# поэтому adjustment выполняется только по официальным коэффициентам эмитента
+# из reference-файла corporate_action_factors.csv (factor — множитель для цен
+# ДО события, приводящий ряд к post-event терминам: сплит 1:100 -> 0.01,
+# консолидация 5000:1 -> 5000). Поправка ratio = close_after / close_before
+# не используется: она обнуляет доходность в день события и стирает обычное
+# рыночное движение этого дня (напр., GMKN 2024-04-08: фактически +1.6%).
 CORP_ACT_THRESHOLD = 0.50
 corp_idx = df.index[df["ret_raw"].abs() > CORP_ACT_THRESHOLD]
 corp_actions = df.loc[corp_idx, ["ticker", "date", "close", "ret_raw"]].copy()
-corp_actions["event"] = corp_actions["ret_raw"].apply(
-    lambda r: "split/consolidation" if r < -0.5 else "reverse-split/aggregation"
+corp_actions["event"] = np.where(
+    corp_actions["ret_raw"] < 0, "split", "reverse-split/consolidation"
 )
-corp_actions.to_csv(PROC / "corporate_actions.csv", index=False)
 
-# Forward-adjust цен каждого тикера, у которого есть corporate actions.
-# Обрабатываем события по очереди (от раннего к позднему), чтобы ratio корректно накапливался.
-# Для каждого события:
-#   close_before = close в строке перед событием
-#   close_after  = close в строке события
-#   ratio = close_after / close_before
-#   Все цены (open/high/low/close) до события умножаются на ratio.
+factors = pd.read_csv(FACTORS, parse_dates=["event_date"])
+factor_map = {(r.ticker, r.event_date): r.factor for r in factors.itertuples()}
+if corp_actions.empty:
+    corp_actions["official_factor"] = pd.Series(dtype=float)
+else:
+    corp_actions["official_factor"] = corp_actions.apply(
+        lambda r: factor_map.get((r["ticker"], r["date"]), np.nan), axis=1
+    )
+corp_actions["status"] = np.where(
+    corp_actions["official_factor"].notna(), "adjusted_official", "NEEDS_MANUAL_REVIEW"
+)
+
+unresolved = corp_actions[corp_actions["status"] == "NEEDS_MANUAL_REVIEW"]
+if not unresolved.empty:
+    print(
+        f"[WARNING] |ret| > {CORP_ACT_THRESHOLD:.0%} без официального коэффициента — "
+        "цены НЕ скорректированы, требуется ручная проверка:\n"
+        f"{unresolved[['ticker', 'date', 'ret_raw']].to_string(index=False)}"
+    )
+
+# Forward-adjust по официальным коэффициентам: все цены (open/high/low/close)
+# строго до события умножаются на factor. Доходность в день события становится
+# residual = close_after / (close_before * factor) - 1 — реальное рыночное
+# движение дня, а не искусственный ноль. События одного тикера обрабатываются
+# от раннего к позднему, чтобы множители корректно накапливались.
 df_adj = df.copy()
 price_cols = ["open", "high", "low", "close"]
 for _, ev in corp_actions.sort_values("date").iterrows():
-    tk = ev["ticker"]
-    ev_date = ev["date"]
-    sub = df_adj[df_adj["ticker"] == tk].sort_values("date").reset_index()
-    ev_pos = sub.index[sub["date"] == ev_date]
-    if len(ev_pos) == 0 or ev_pos[0] == 0:
+    if pd.isna(ev["official_factor"]):
         continue
-    pos = int(ev_pos[0])
-    close_before = float(sub.loc[pos - 1, "close"])
-    close_after = float(sub.loc[pos, "close"])
-    if close_before <= 0:
-        continue
-    ratio = close_after / close_before
-    # Маска для строк до события этого тикера
-    pre_mask = (df_adj["ticker"] == tk) & (df_adj["date"] < ev_date)
-    for col in price_cols:
-        df_adj.loc[pre_mask, col] = df_adj.loc[pre_mask, col] * ratio
+    pre_mask = (df_adj["ticker"] == ev["ticker"]) & (df_adj["date"] < ev["date"])
+    df_adj.loc[pre_mask, price_cols] = df_adj.loc[pre_mask, price_cols] * ev["official_factor"]
 
 # Считаем returns на adjusted close
 df["ret"] = df_adj.groupby("ticker")["close"].pct_change(fill_method=None)
+
+# Контроль качества коэффициента: доходность в день события после adjustment
+# должна быть обычным рыночным движением (|ret| << 50%), а не нулём или скачком.
+corp_actions["ret_event_day_adjusted"] = df.loc[corp_actions.index, "ret"].to_numpy()
+bad_adj = corp_actions[corp_actions["ret_event_day_adjusted"].abs() > CORP_ACT_THRESHOLD]
+if not bad_adj.empty:
+    print(
+        "[WARNING] После adjustment |ret| в день события всё ещё > "
+        f"{CORP_ACT_THRESHOLD:.0%} — проверьте коэффициент:\n"
+        f"{bad_adj[['ticker', 'date', 'official_factor', 'ret_event_day_adjusted']]}"
+    )
+corp_actions.to_csv(PROC / "corporate_actions.csv", index=False)
 df["ret_fwd_1d"] = df_adj.groupby("ticker")["close"].shift(-1) / df_adj["close"] - 1
 df["ret_fwd_5d"] = df_adj.groupby("ticker")["close"].shift(-5) / df_adj["close"] - 1
 df["ret_fwd_20d"] = df_adj.groupby("ticker")["close"].shift(-20) / df_adj["close"] - 1

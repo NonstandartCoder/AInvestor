@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path("..")
+ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "data" / "raw"
 RAW.mkdir(parents=True, exist_ok=True)
 

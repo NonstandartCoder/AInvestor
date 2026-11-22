@@ -59,23 +59,24 @@ TZ=Europe/Moscow
 ├── app/
 │   ├── eda/
 │   │   ├── 01_fetch_moex_ohlcv.py   # загрузка OHLCV с MOEX ISS API
-│   │   └── 02_eda_analysis.py       # EDA: очистка, adjustment, визуализации, отчёт
+│   │   ├── 02_eda_analysis.py       # EDA: очистка, adjustment, визуализации, отчёт
+│   │   └── corporate_action_factors.csv  # официальные коэффициенты сплитов/консолидаций
 │   ├── data/
 │   │   ├── raw/                     # сырые данные
 │   │   │   ├── ohlcv_all.csv        # combined OHLCV, 10 582 строки × 15 тикеров
 │   │   │   └── ohlcv_<TICKER>.csv   # по тикерам
 │   │   └── processed/               # обработанные агрегаты
-│   │       ├── returns_long.parquet # long-format с fwd-1d/5d/20d returns
+│   │       ├── returns_long.parquet # long-format с fwd-1d/5d/20d returns (10 559 строк)
 │   │       ├── summary_stats.csv    # сводная по тикерам
 │   │       ├── up_down_flat.csv     # структура направлений
 │   │       ├── corr_returns.csv     # корреляционная матрица
-│   │       └── corporate_actions.csv # детектированные сплиты/консолидации
-│   ├── docs/
-│   │   └── ml_system_design_doc.md  # основной дизайн-документ
+│   │       └── corporate_actions.csv # детектированные КД + официальные коэффициенты
 │   └── reports/
 │       └── eda/
 │           ├── EDA_report.md        # EDA-отчёт с выводами
 │           └── figures/             # визуализации PNG
+├── docs/
+│   └── ml_system_design_doc.md      # основной дизайн-документ
 ├── .dockerignore
 ├── docker-compose.yml
 ├── Dockerfile
@@ -107,11 +108,11 @@ TZ=Europe/Moscow
 
 Период: 2023-01-03 … 2025-11-13 (~746 торговых дней). 15 тикеров MOEX (топ IMOEX по ликвидности).
 
-- **Объём**: 10 582 сырых строк; после dropna по close = 10 240; дубликатов 0.
-- **Корпоративные действия** (3 события): GMKN 2024-04-08 (-99% split), PLZL 2025-03-27 (-90% split), VTBR 2024-07-15 (+466 200% reverse-split/aggregation). MOEX ISS не делает price-adjustment — реализован `forward-adjust` по `ratio = close_after / close_before` в `app/eda/02_eda_analysis.py` секция 3.
+- **Объём**: 10 582 сырых строк; 23 строки с NaN close (переходные дни корпоративных действий); после dropna по close = 10 559; дубликатов 0.
+- **Корпоративные действия** (3 события): GMKN 2024-04-08 (сплит 1:100), PLZL 2025-03-27 (сплит 1:10), VTBR 2024-07-15 (консолидация 5000:1). MOEX ISS не делает price-adjustment — реализован `forward-adjust` по официальным коэффициентам эмитентов (справочник `app/data/reference/corporate_action_factors.csv`), скачок |ret| > 50% используется только как сигнал детекции; см. `app/eda/02_eda_analysis.py` секция 3. Доходность в день события сохраняет реальное рыночное движение (GMKN +1.6%, PLZL −1.8%, VTBR −6.7%), а не обнуляется поправкой `close_after / close_before`.
 - **YDEX**: только 348 строк с 2024-07-08 (после редомициляции Yandex NV → YDEX).
 - **Cross-ticker корреляция**: средняя 0.538, максимум SBER↔YDEX = 0.795 — типично для MOEX; ограничивает ценность purely price-based фичей.
-- **Распределение доходностей**: mean +0.029%/день, std 1.93%/день (annualized vol 30.7%), kurtosis 6.45 (тяжёлые хвосты).
+- **Распределение доходностей**: mean +0.028%/день, std 1.94%/день (annualized vol 30.7%), kurtosis 6.44 (тяжёлые хвосты).
 - **Направления** (fwd-1d, порог flat ±0.5%): up 34.5% / flat 29.7% / down 35.8% — class imbalance.
 - **Оборот**: ~50 млрд ₽/день по 15 тикерам; ликвидность достаточна для paper trading с депозитом 300 000 ₽.
 
