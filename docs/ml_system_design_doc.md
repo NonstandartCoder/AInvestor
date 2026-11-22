@@ -373,7 +373,7 @@ flowchart TD
    - **GMKN 2024-04-08**: -99% за день (split 100:1, цена упала с ~15 296 ₽ до 153 ₽).
    - **PLZL 2025-03-27**: -90% за день (split 10:1, цена упала с ~18 676 ₽ до 1 868 ₽).
    - **VTBR 2024-07-15**: +466 282% (консолидация 5000:1 + переходный период с NaN-строками 2024-07-09..12).
-     MOEX ISS отдаёт raw historical prices без adjustment (в отличие от yfinance, который отдаёт adjusted). **Решение ETL**: шаг `adjust_corporate_actions` — скачок |pct_change| > 50% между соседними торговыми днями используется **только как сигнал детекции**; корректировка выполняется по **официальным коэффициентам эмитентов** (справочник `../data/reference/corporate_action_factors.csv`: GMKN ×0.01, PLZL ×0.1, VTBR ×5000) — все цены (open/high/low/close) до события умножаются на factor. Поправка `ratio = close_after / close_before` **не используется**: она обнуляет доходность в день события и стирает обычное рыночное движение этого дня (фактически GMKN 2024-04-08: +1.6%, PLZL 2025-03-27: −1.8%, VTBR 2024-07-15: −6.7%). Событие без официального коэффициента не корректируется и помечается `NEEDS_MANUAL_REVIEW`. Реализовано в `app/eda/02_eda_analysis.py` секция 3; на adjusted данных annualized volatility вернулась к реалистичным 30.7% (было 14401% из-за fake-returns на интерполяции).
+     MOEX ISS отдаёт raw historical prices без adjustment (в отличие от yfinance, который отдаёт adjusted). **Решение ETL**: шаг `adjust_corporate_actions` — скачок |pct_change| > 50% между соседними торговыми днями используется **только как сигнал детекции**; корректировка выполняется по **официальным коэффициентам эмитентов** (справочник `app/data/reference/corporate_action_factors.csv`: GMKN ×0.01, PLZL ×0.1, VTBR ×5000) — все цены (open/high/low/close) до события умножаются на factor. Поправка `ratio = close_after / close_before` **не используется**: она обнуляет доходность в день события и стирает обычное рыночное движение этого дня (фактически GMKN 2024-04-08: +1.6%, PLZL 2025-03-27: −1.8%, VTBR 2024-07-15: −6.7%). Событие без официального коэффициента не корректируется и помечается `NEEDS_MANUAL_REVIEW`. Реализовано в `app/eda/02_eda_analysis.py` секция 3; на adjusted данных annualized volatility вернулась к реалистичным 30.7% (было 14401% из-за fake-returns на интерполяции).
 
 2. **YDEX — укороченная история**: только 348 строк с 2024-07-08 (после редомициляции Yandex NV → YDEX). До июля 2024 ценовой истории по Yandex на MOEX нет. **Решение**: либо исключить YDEX из watchlist на первых итерациях, либо обучать только на данных с 2024-07 (16 мес — минимально достаточно для boosting-бейзлайна, но не для лагов 20+).
 
@@ -547,7 +547,7 @@ Final hold-out test: 2025-08..2025-11 (3 мес, out-of-sample, не перес�
 
 - **Предобработка** (на каждом walk-forward fold):
   1. `dropna(subset=['close'])` — удалить переходные дни (23 строки в EDA).
-  2. `adjust_corporate_actions` — forward-adjust цен по официальным коэффициентам эмитентов (см. Этап 1.2, реализация в `app/eda/02_eda_analysis.py`, справочник `../data/reference/corporate_action_factors.csv`).
+  2. `adjust_corporate_actions` — forward-adjust цен по официальным коэффициентам эмитентов (см. Этап 1.2, реализация в `app/eda/02_eda_analysis.py`, справочник `app/data/reference/corporate_action_factors.csv`).
   3. Категориальные фичи (`ticker`, `sector`) — target encoding / leave-one-out (CatBoost нативно через `cat_features`).
   4. Numerical features — standard scaling внутри walk-forward fold (fit на train, transform на val/test).
   5. Winsorization целевой `return_pct` на ±3σ (~±6%).

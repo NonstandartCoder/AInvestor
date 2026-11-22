@@ -162,5 +162,5 @@ reports/eda/figures/*.png           # 8 визуализаций
 reports/eda/EDA_report.md           # этот отчёт
 eda/01_fetch_moex_ohlcv.py          # скрипт загрузки
 eda/02_eda_analysis.py              # скрипт визуализаций
-eda/corporate_action_factors.csv    # справочник официальных коэффициентов КД
+data/reference/corporate_action_factors.csv  # справочник официальных коэффициентов КД
 ```

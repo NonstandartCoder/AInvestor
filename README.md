@@ -59,9 +59,10 @@ TZ=Europe/Moscow
 ├── app/
 │   ├── eda/
 │   │   ├── 01_fetch_moex_ohlcv.py   # загрузка OHLCV с MOEX ISS API
-│   │   ├── 02_eda_analysis.py       # EDA: очистка, adjustment, визуализации, отчёт
-│   │   └── corporate_action_factors.csv  # официальные коэффициенты сплитов/консолидаций
+│   │   └── 02_eda_analysis.py       # EDA: очистка, adjustment, визуализации, отчёт
 │   ├── data/
+│   │   ├── reference/               # справочники (вручную поддерживаемые)
+│   │   │   └── corporate_action_factors.csv  # официальные коэффициенты сплитов/консолидаций
 │   │   ├── raw/                     # сырые данные
 │   │   │   ├── ohlcv_all.csv        # combined OHLCV, 10 582 строки × 15 тикеров
 │   │   │   └── ohlcv_<TICKER>.csv   # по тикерам
